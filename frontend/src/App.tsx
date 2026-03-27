@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import {
   createBounty,
+  exportReleasedPayoutsCsv,
   listBounties,
   listOpenIssues,
   refundBounty,
@@ -51,6 +52,7 @@ function App() {
   const [issues, setIssues] = useState<OpenIssue[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function refresh(): Promise<void> {
@@ -172,6 +174,24 @@ function App() {
     }
   }
 
+  async function handleExportReleasedPayouts() {
+    try {
+      setExporting(true);
+      setError(null);
+      const { blob, filename } = await exportReleasedPayoutsCsv();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to export released payouts.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <div className="page-shell">
       <div className="glow glow-left" />
@@ -193,6 +213,14 @@ function App() {
             <a href="#issues" className="secondary-link">
               Contribution backlog
             </a>
+            <button
+              type="button"
+              className="secondary-link"
+              disabled={exporting}
+              onClick={() => void handleExportReleasedPayouts()}
+            >
+              {exporting ? "Exporting..." : "Export released payouts (CSV)"}
+            </button>
           </div>
         </div>
 
