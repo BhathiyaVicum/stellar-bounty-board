@@ -10,19 +10,7 @@ export type BountyStatus =
   | "refunded"
   | "expired";
 
-export type EventType =
-  | "created"
-  | "reserved"
-  | "submitted"
-  | "released"
-  | "refunded"
-  | "expired";
 
-export interface BountyEvent {
-  type: EventType;
-  timestamp: number;
-  actor?: string;
-  details?: Record<string, unknown>;
 }
 
 export interface BountyRecord {
@@ -68,11 +56,30 @@ export interface CreateBountyInput {
   reservationTimeoutSeconds?: number;
 }
 
+interface CreateAuditLogInput {
+  bountyId: string;
+  fromStatus: BountyStatus;
+  toStatus: BountyStatus;
+  transition: BountyTransitionType;
+  actor: string;
+  timestamp?: number;
+  metadata?: Record<string, AuditMetadataValue | undefined>;
+}
+
 function getStorePath(): string {
   if (process.env.BOUNTY_STORE_PATH?.trim()) {
     return path.resolve(process.env.BOUNTY_STORE_PATH.trim());
   }
   return path.resolve(__dirname, "../../data/bounties.json");
+}
+
+function getAuditStorePath(): string {
+  if (process.env.BOUNTY_AUDIT_STORE_PATH?.trim()) {
+    return path.resolve(process.env.BOUNTY_AUDIT_STORE_PATH.trim());
+  }
+
+  const base = getStorePath();
+  return base.endsWith(".json") ? base.replace(/\.json$/i, ".audit.json") : `${base}.audit.json`;
 }
 
 const sampleBounties: BountyRecord[] = [
@@ -126,6 +133,8 @@ function nowInSeconds(): number {
 function ensureStore(): void {
   const storePath = getStorePath();
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  ensureAuditStore();
+
   if (!fs.existsSync(storePath)) {
     fs.writeFileSync(storePath, JSON.stringify(sampleBounties, null, 2));
     return;
@@ -134,6 +143,21 @@ function ensureStore(): void {
   const raw = fs.readFileSync(storePath, "utf8").trim();
   if (!raw) {
     fs.writeFileSync(storePath, JSON.stringify(sampleBounties, null, 2));
+  }
+}
+
+function ensureAuditStore(): void {
+  const storePath = getAuditStorePath();
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+
+  if (!fs.existsSync(storePath)) {
+    fs.writeFileSync(storePath, JSON.stringify([], null, 2));
+    return;
+  }
+
+  const raw = fs.readFileSync(storePath, "utf8").trim();
+  if (!raw) {
+    fs.writeFileSync(storePath, JSON.stringify([], null, 2));
   }
 }
 
@@ -147,9 +171,66 @@ function writeStore(records: BountyRecord[]): void {
   fs.writeFileSync(getStorePath(), JSON.stringify(records, null, 2));
 }
 
+function readAuditStore(): BountyAuditLogRecord[] {
+  ensureAuditStore();
+  return JSON.parse(fs.readFileSync(getAuditStorePath(), "utf8")) as BountyAuditLogRecord[];
+}
+
+function writeAuditStore(records: BountyAuditLogRecord[]): void {
+  fs.writeFileSync(getAuditStorePath(), JSON.stringify(records, null, 2));
+}
+
+function nextAuditId(records: BountyAuditLogRecord[]): string {
+  const highest = records.reduce((max, record) => {
+    const numeric = Number(record.id.replace("AUD-", ""));
+    return Number.isFinite(numeric) ? Math.max(max, numeric) : max;
+  }, 0);
+  return `AUD-${String(highest + 1).padStart(6, "0")}`;
+}
+
+function cleanAuditMetadata(
+  metadata?: Record<string, AuditMetadataValue | undefined>,
+): Record<string, AuditMetadataValue> | undefined {
+  if (!metadata) {
+    return undefined;
+  }
+
+  const entries = Object.entries(metadata).filter(([, value]) => value !== undefined);
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  return Object.fromEntries(entries) as Record<string, AuditMetadataValue>;
+}
+
+function appendAuditLogs(inputs: CreateAuditLogInput[]): void {
+  if (inputs.length === 0) {
+    return;
+  }
+
+  const existing = readAuditStore();
+  const next = [...existing];
+
+  for (const input of inputs) {
+    next.push({
+      id: nextAuditId(next),
+      bountyId: input.bountyId,
+      fromStatus: input.fromStatus,
+      toStatus: input.toStatus,
+      transition: input.transition,
+      actor: input.actor,
+      timestamp: input.timestamp ?? nowInSeconds(),
+      metadata: cleanAuditMetadata(input.metadata),
+    });
+  }
+
+  writeAuditStore(next);
+}
+
 function normalizeRecords(records: BountyRecord[]): BountyRecord[] {
   const now = nowInSeconds();
   let changed = false;
+  const auditEntries: CreateAuditLogInput[] = [];
 
   const next = records.map((record) => {
     // Ensure events array exists (for backward compatibility)
@@ -158,6 +239,18 @@ function normalizeRecords(records: BountyRecord[]): BountyRecord[] {
     // Check for expired deadline
     if ((record.status === "open" || record.status === "reserved") && now > record.deadlineAt) {
       changed = true;
+      auditEntries.push({
+        bountyId: record.id,
+        fromStatus: record.status,
+        toStatus: "expired",
+        transition: "expire",
+        actor: "system",
+        timestamp: now,
+        metadata: {
+          reason: "deadline_passed",
+          deadlineAt: record.deadlineAt,
+        },
+      });
       return {
         ...record,
         status: "expired" as const,
@@ -204,6 +297,7 @@ function normalizeRecords(records: BountyRecord[]): BountyRecord[] {
 
   if (changed) {
     writeStore(next);
+    appendAuditLogs(auditEntries);
   }
   return next;
 }
@@ -304,7 +398,17 @@ export function reserveBounty(id: string, contributor: string, expectedVersion?:
     ],
   };
 
-  return persistUpdated(records, updated);
+  const persisted = persistUpdated(records, updated);
+  appendAuditLogs([
+    {
+      bountyId: id,
+      fromStatus: bounty.status,
+      toStatus: "reserved",
+      transition: "reserve",
+      actor: contributor,
+    },
+  ]);
+  return persisted;
 }
 
 export function submitBounty(
@@ -337,7 +441,21 @@ export function submitBounty(
     ],
   };
 
-  return persistUpdated(records, updated);
+  const persisted = persistUpdated(records, updated);
+  appendAuditLogs([
+    {
+      bountyId: id,
+      fromStatus: bounty.status,
+      toStatus: "submitted",
+      transition: "submit",
+      actor: contributor,
+      metadata: {
+        submissionUrl,
+        hasNotes: Boolean(notes?.trim()),
+      },
+    },
+  ]);
+  return persisted;
 }
 
 export function releaseBounty(id: string, maintainer: string, transactionHash?: string): BountyRecord {
@@ -364,7 +482,20 @@ export function releaseBounty(id: string, maintainer: string, transactionHash?: 
     ],
   };
 
-  return persistUpdated(records, updated);
+  const persisted = persistUpdated(records, updated);
+  appendAuditLogs([
+    {
+      bountyId: id,
+      fromStatus: bounty.status,
+      toStatus: "released",
+      transition: "release",
+      actor: maintainer,
+      metadata: {
+        transactionHash: updated.releasedTxHash,
+      },
+    },
+  ]);
+  return persisted;
 }
 
 export function refundBounty(id: string, maintainer: string, transactionHash?: string): BountyRecord {
@@ -394,86 +525,22 @@ export function refundBounty(id: string, maintainer: string, transactionHash?: s
     ],
   };
 
-  return persistUpdated(records, updated);
+  const persisted = persistUpdated(records, updated);
+  appendAuditLogs([
+    {
+      bountyId: id,
+      fromStatus: bounty.status,
+      toStatus: "refunded",
+      transition: "refund",
+      actor: maintainer,
+      metadata: {
+        transactionHash: updated.refundedTxHash,
+      },
+    },
+  ]);
+  return persisted;
 }
 
 
-
-export function getBountyEvents(id: string): BountyEvent[] {
-  const records = listBounties();
-  const bounty = findBounty(records, id);
-  return bounty.events;
-}
-
-export interface MaintainerMetrics {
-  maintainer: string;
-  totalBounties: number;
-  openCount: number;
-  reservedCount: number;
-  submittedCount: number;
-  releasedCount: number;
-  refundedCount: number;
-  expiredCount: number;
-  totalFunded: number;
-  totalReleased: number;
-  averageRewardAmount: number;
-}
-
-export function getMaintainerMetrics(maintainerAddress: string): MaintainerMetrics {
-  const records = listBounties();
-  const bounties = records.filter((b) => b.maintainer === maintainerAddress);
-
-  const metrics: MaintainerMetrics = {
-    maintainer: maintainerAddress,
-    totalBounties: bounties.length,
-    openCount: bounties.filter((b) => b.status === "open").length,
-    reservedCount: bounties.filter((b) => b.status === "reserved").length,
-    submittedCount: bounties.filter((b) => b.status === "submitted").length,
-    releasedCount: bounties.filter((b) => b.status === "released").length,
-    refundedCount: bounties.filter((b) => b.status === "refunded").length,
-    expiredCount: bounties.filter((b) => b.status === "expired").length,
-    totalFunded: bounties.reduce((sum, b) => sum + b.amount, 0),
-    totalReleased: bounties
-      .filter((b) => b.status === "released")
-      .reduce((sum, b) => sum + b.amount, 0),
-    averageRewardAmount: bounties.length > 0 ? bounties.reduce((sum, b) => sum + b.amount, 0) / bounties.length : 0,
-  };
-
-  return metrics;
-}
-
-export interface GlobalMetrics {
-  totalBounties: number;
-  openCount: number;
-  reservedCount: number;
-  submittedCount: number;
-  releasedCount: number;
-  refundedCount: number;
-  expiredCount: number;
-  totalFunded: number;
-  totalReleased: number;
-  uniqueMaintainers: number;
-  uniqueContributors: number;
-}
-
-export function getGlobalMetrics(): GlobalMetrics {
-  const records = listBounties();
-  const maintainers = new Set(records.map((b) => b.maintainer));
-  const contributors = new Set(records.filter((b) => b.contributor).map((b) => b.contributor!));
-
-  return {
-    totalBounties: records.length,
-    openCount: records.filter((b) => b.status === "open").length,
-    reservedCount: records.filter((b) => b.status === "reserved").length,
-    submittedCount: records.filter((b) => b.status === "submitted").length,
-    releasedCount: records.filter((b) => b.status === "released").length,
-    refundedCount: records.filter((b) => b.status === "refunded").length,
-    expiredCount: records.filter((b) => b.status === "expired").length,
-    totalFunded: records.reduce((sum, b) => sum + b.amount, 0),
-    totalReleased: records
-      .filter((b) => b.status === "released")
-      .reduce((sum, b) => sum + b.amount, 0),
-    uniqueMaintainers: maintainers.size,
-    uniqueContributors: contributors.size,
   };
 }
